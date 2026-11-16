@@ -1,0 +1,145 @@
+----------------------------------------------------------------------------------
+-- 01_privilege_audit.sql
+-- Db2 LUW 11.5.x (DPF) - Effective privilege report for ONE authorization ID
+--
+-- Resolves: direct user + OS groups + PUBLIC + roles (nested, up to 10 levels)
+-- Reports : instance authorities, database authorities, object privileges,
+--           and objects owned by the identity (implicit CONTROL)
+--
+-- BEFORE RUNNING
+--   1. Connect first:   db2 connect to <DBNAME>
+--   2. Replace the placeholder APP_SHARED_USER (see README for a sed one-liner)
+--      Use UPPERCASE unless the authid was created case-sensitive.
+--
+-- USAGE
+--   db2 -txf 01_privilege_audit.sql | sed 's/[[:space:]]*$//' \
+--       | grep -v 'record(s) selected' > user_permissions.csv
+--
+-- Requires SYSADM/DBADM/SECADM/ACCESSCTRL, or SELECT on the catalog views.
+-- Authorizations live in the catalog partition; run from any partition.
+----------------------------------------------------------------------------------
+
+-- CSV header
+SELECT 'PRIVILEGE_CATEGORY,GRANTED_VIA,OBJECT_TYPE,OBJECT_NAME,PERMISSION,GRANTABLE_OR_ACTIVE'
+FROM SYSIBM.SYSDUMMY1;
+
+WITH TARGET_USER (AUTHID) AS (
+    VALUES (CAST('APP_SHARED_USER' AS VARCHAR(128)))
+),
+
+-- 1. Base identities: direct user, OS groups, PUBLIC
+BASE_IDS (AUTHID, AUTHIDTYPE, SOURCE) AS (
+    SELECT T.AUTHID, 'U', CAST('DIRECT USER' AS VARCHAR(400))
+    FROM TARGET_USER T
+    UNION ALL
+    SELECT CAST(UPPER(G.GRP) AS VARCHAR(128)), 'G',
+           CAST('OS GROUP: ' || RTRIM(G.GRP) AS VARCHAR(400))
+    FROM TARGET_USER T,
+         TABLE(SYSPROC.AUTH_LIST_GROUPS_FOR_AUTHID(T.AUTHID)) AS G(GRP)
+    UNION ALL
+    SELECT 'PUBLIC', 'G', CAST('PUBLIC' AS VARCHAR(400))
+    FROM SYSIBM.SYSDUMMY1
+),
+
+-- 2. Recursive role resolution (roles granted to roles)
+ALL_ROLES (ROLENAME, SOURCE, DEPTH) AS (
+    SELECT CAST(R.ROLENAME AS VARCHAR(128)),
+           CAST('ROLE ' || RTRIM(R.ROLENAME) || ' <- ' || B.SOURCE AS VARCHAR(400)),
+           1
+    FROM SYSCAT.ROLEAUTH R, BASE_IDS B
+    WHERE R.GRANTEE = B.AUTHID
+      AND R.GRANTEETYPE = B.AUTHIDTYPE
+    UNION ALL
+    SELECT CAST(R.ROLENAME AS VARCHAR(128)),
+           CAST('ROLE ' || RTRIM(R.ROLENAME) || ' <- ROLE ' || RTRIM(A.ROLENAME) AS VARCHAR(400)),
+           A.DEPTH + 1
+    FROM SYSCAT.ROLEAUTH R, ALL_ROLES A
+    WHERE R.GRANTEE = A.ROLENAME
+      AND R.GRANTEETYPE = 'R'
+      AND A.DEPTH < 10
+),
+
+-- 3. All identities whose privileges apply
+EFFECTIVE_IDS (AUTHID, AUTHIDTYPE, SOURCE) AS (
+    SELECT AUTHID, AUTHIDTYPE, SOURCE FROM BASE_IDS
+    UNION ALL
+    SELECT ROLENAME, 'R', SOURCE FROM ALL_ROLES
+),
+
+-- 4. Report rows
+REPORT_DATA (CAT, VIA, OBJ_TYPE, OBJ_NAME, PERM, GRANTABLE) AS (
+
+    -- 0. Instance authorities (SYSADM/SYSCTRL/SYSMAINT/SYSMON): not in the catalog
+    SELECT '0. INSTANCE AUTHORITY',
+           RTRIM(CASE WHEN A.D_USER      <> 'N' THEN 'USER '        ELSE '' END ||
+                 CASE WHEN A.D_GROUP     <> 'N' THEN 'OSGROUP '     ELSE '' END ||
+                 CASE WHEN A.D_PUBLIC    <> 'N' THEN 'PUBLIC '      ELSE '' END ||
+                 CASE WHEN A.ROLE_USER   <> 'N' THEN 'ROLE(user) '  ELSE '' END ||
+                 CASE WHEN A.ROLE_GROUP  <> 'N' THEN 'ROLE(group) ' ELSE '' END ||
+                 CASE WHEN A.ROLE_PUBLIC <> 'N' THEN 'ROLE(public)' ELSE '' END),
+           'INSTANCE', CURRENT SERVER, RTRIM(A.AUTHORITY), 'YES'
+    FROM TARGET_USER T,
+         TABLE(SYSPROC.AUTH_LIST_AUTHORITIES_FOR_AUTHID(T.AUTHID, 'U')) AS A
+    WHERE A.AUTHORITY LIKE 'SYS%'
+      AND (A.D_USER <> 'N' OR A.D_GROUP <> 'N' OR A.D_PUBLIC <> 'N'
+        OR A.ROLE_USER <> 'N' OR A.ROLE_GROUP <> 'N' OR A.ROLE_PUBLIC <> 'N')
+
+    UNION ALL
+    -- 1. Database authorities ("system privileges")
+    SELECT '1. DATABASE AUTHORITY', E.SOURCE, 'DATABASE', CURRENT SERVER, P.PRIVILEGE, 'YES'
+    FROM EFFECTIVE_IDS E
+    JOIN (
+        SELECT GRANTEE, GRANTEETYPE, 'DBADM'           AS PRIVILEGE FROM SYSCAT.DBAUTH WHERE DBADMAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'SECADM'          FROM SYSCAT.DBAUTH WHERE SECURITYADMAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'ACCESSCTRL'      FROM SYSCAT.DBAUTH WHERE ACCESSCTRLAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'DATAACCESS'      FROM SYSCAT.DBAUTH WHERE DATAACCESSAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'CREATETAB'       FROM SYSCAT.DBAUTH WHERE CREATETABAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'BINDADD'         FROM SYSCAT.DBAUTH WHERE BINDADDAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'CONNECT'         FROM SYSCAT.DBAUTH WHERE CONNECTAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'NOFENCE'         FROM SYSCAT.DBAUTH WHERE NOFENCEAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'IMPLSCHEMA'      FROM SYSCAT.DBAUTH WHERE IMPLSCHEMAAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'LOAD'            FROM SYSCAT.DBAUTH WHERE LOADAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'EXTERNALROUTINE' FROM SYSCAT.DBAUTH WHERE EXTERNALROUTINEAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'QUIESCECONNECT'  FROM SYSCAT.DBAUTH WHERE QUIESCECONNECTAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'EXPLAIN'         FROM SYSCAT.DBAUTH WHERE EXPLAINAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'SQLADM'          FROM SYSCAT.DBAUTH WHERE SQLADMAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'WLMADM'          FROM SYSCAT.DBAUTH WHERE WLMADMAUTH = 'Y'
+        UNION ALL SELECT GRANTEE, GRANTEETYPE, 'LIBRARYADM'      FROM SYSCAT.DBAUTH WHERE LIBRARYADMAUTH = 'Y'
+    ) P ON E.AUTHID = P.GRANTEE AND E.AUTHIDTYPE = P.GRANTEETYPE
+
+    UNION ALL
+    -- 2. Object privileges
+    --    PUBLIC's default grants on system schemas are hidden to reduce noise.
+    --    SYSPROC stays visible (PUBLIC has EXECUTE on ADMIN_CMD by default).
+    --    Remove the WHERE clause to see everything.
+    SELECT '2. OBJECT PRIVILEGE', E.SOURCE,
+           COALESCE(RTRIM(P.OBJECTTYPE), ''),
+           COALESCE(RTRIM(P.OBJECTSCHEMA) || '.', '') || COALESCE(RTRIM(P.OBJECTNAME), ''),
+           COALESCE(RTRIM(P.PRIVILEGE), ''),
+           CASE WHEN P.GRANTABLE = 'Y' THEN 'WITH GRANT OPTION' ELSE 'NO' END
+    FROM EFFECTIVE_IDS E
+    JOIN SYSIBMADM.PRIVILEGES P
+      ON E.AUTHID = P.AUTHID AND E.AUTHIDTYPE = P.AUTHIDTYPE
+    WHERE NOT (E.AUTHID = 'PUBLIC'
+               AND (COALESCE(P.OBJECTSCHEMA,'') LIKE 'SYS%'
+                    AND COALESCE(P.OBJECTSCHEMA,'') <> 'SYSPROC'
+                 OR COALESCE(P.OBJECTSCHEMA,'') IN ('NULLID','SQLJ')))
+
+    UNION ALL
+    -- 3. Objects owned (implicit CONTROL)
+    SELECT '3. OWNED OBJECT', E.SOURCE,
+           COALESCE(RTRIM(O.OBJECTTYPE), ''),
+           COALESCE(RTRIM(O.OBJECTSCHEMA) || '.', '') || COALESCE(RTRIM(O.OBJECTNAME), ''),
+           'OWNER (implicit CONTROL)', 'YES'
+    FROM EFFECTIVE_IDS E
+    JOIN SYSIBMADM.OBJECTOWNERS O
+      ON E.AUTHID = O.OWNER AND E.AUTHIDTYPE = O.OWNERTYPE
+)
+SELECT '"' || COALESCE(RTRIM(CAT),'')       || '",' ||
+       '"' || COALESCE(RTRIM(VIA),'')       || '",' ||
+       '"' || COALESCE(RTRIM(OBJ_TYPE),'')  || '",' ||
+       '"' || COALESCE(RTRIM(OBJ_NAME),'')  || '",' ||
+       '"' || COALESCE(RTRIM(PERM),'')      || '",' ||
+       '"' || COALESCE(RTRIM(GRANTABLE),'') || '"'
+FROM REPORT_DATA
+ORDER BY CAT, OBJ_TYPE, OBJ_NAME, PERM;
